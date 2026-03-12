@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
 
+const SHOW_REFERENCES_COMMAND = "gdscriptReferenceCodeLens.showReferences";
+
 export function activate(context: vscode.ExtensionContext) {
   const provider = new GDScriptReferenceCodeLensProvider();
 
@@ -10,6 +12,15 @@ export function activate(context: vscode.ExtensionContext) {
         { language: "gd", scheme: "file" }
       ],
       provider
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      SHOW_REFERENCES_COMMAND,
+      async (uri: vscode.Uri, position: vscode.Position) => {
+        await showReferencesAtPosition(uri, position);
+      }
     )
   );
 
@@ -36,6 +47,41 @@ function isGDScriptDocument(doc: vscode.TextDocument): boolean {
     doc.languageId === "gd" ||
     doc.fileName.endsWith(".gd")
   );
+}
+
+async function showReferencesAtPosition(
+  uri: vscode.Uri,
+  position: vscode.Position
+): Promise<void> {
+  const document = await vscode.workspace.openTextDocument(uri);
+  const selection = new vscode.Selection(position, position);
+  const revealRange = new vscode.Range(position, position);
+  const editor = await vscode.window.showTextDocument(document, {
+    selection,
+    preview: false
+  });
+
+  editor.selection = selection;
+  editor.revealRange(revealRange, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+
+  const locations = await getFilteredReferences(uri, position);
+  await vscode.commands.executeCommand(
+    "editor.action.showReferences",
+    uri,
+    position,
+    locations
+  );
+}
+
+class GDScriptCodeLens extends vscode.CodeLens {
+  constructor(
+    range: vscode.Range,
+    public readonly documentUri: vscode.Uri,
+    public readonly definitionPosition: vscode.Position,
+    public readonly funcName: string
+  ) {
+    super(range);
+  }
 }
 
 class GDScriptReferenceCodeLensProvider implements vscode.CodeLensProvider {
@@ -80,14 +126,7 @@ class GDScriptReferenceCodeLensProvider implements vscode.CodeLensProvider {
       const position = new vscode.Position(line, char);
       const range = new vscode.Range(position, position);
 
-      lenses.push(
-        new vscode.CodeLens(range, {
-          title: "References: …",
-          command: "",
-          arguments: [],
-          tooltip: `Loading references for ${funcName}`
-        })
-      );
+      lenses.push(new GDScriptCodeLens(range, document.uri, position, funcName));
     }
 
     return lenses;
@@ -97,47 +136,76 @@ class GDScriptReferenceCodeLensProvider implements vscode.CodeLensProvider {
     codeLens: vscode.CodeLens,
     token: vscode.CancellationToken
   ): Promise<vscode.CodeLens> {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) return codeLens;
+    if (!(codeLens instanceof GDScriptCodeLens)) {
+      return codeLens;
+    }
 
-    const document = editor.document;
-    if (!isGDScriptDocument(document)) return codeLens;
-
-    const position = codeLens.range.start;
+    const { documentUri, definitionPosition, funcName } = codeLens;
 
     try {
-      const locations = (await vscode.commands.executeCommand<vscode.Location[]>(
-        "vscode.executeReferenceProvider",
-        document.uri,
-        position
-      )) ?? [];
+      const locations = await getFilteredReferences(documentUri, definitionPosition);
 
       if (token.isCancellationRequested) {
         return codeLens;
       }
-
-      // 通常引用结果会把定义本身也算进去，减掉当前定义更符合直觉
-      const filtered = locations.filter((loc) => {
-        return !sameLocationAsDefinition(loc, document.uri, position);
-      });
-
-      const count = filtered.length;
-
-      codeLens.command = {
-        title: count === 1 ? "1 reference" : `${count} references`,
-        command: "editor.action.referenceSearch.trigger",
-        arguments: [document.uri, position]
-      };
-
+      codeLens.command = buildReferenceCommand(
+        formatReferenceTitle(locations.length),
+        documentUri,
+        definitionPosition,
+        funcName
+      );
       return codeLens;
     } catch {
-      codeLens.command = {
-        title: "0 references",
-        command: ""
-      };
+      if (token.isCancellationRequested) {
+        return codeLens;
+      }
+
+      codeLens.command = buildReferenceCommand(
+        "0 references",
+        documentUri,
+        definitionPosition,
+        funcName
+      );
       return codeLens;
     }
   }
+}
+
+function buildReferenceCommand(
+  title: string,
+  uri: vscode.Uri,
+  position: vscode.Position,
+  funcName: string
+): vscode.Command {
+  return {
+    title,
+    command: SHOW_REFERENCES_COMMAND,
+    arguments: [uri, position],
+    tooltip: `Show references for ${funcName}`
+  };
+}
+
+function formatReferenceTitle(count: number): string {
+  if (count === 1) {
+    return "1 reference";
+  }
+
+  return `${count} references`;
+}
+
+async function getFilteredReferences(
+  uri: vscode.Uri,
+  position: vscode.Position
+): Promise<vscode.Location[]> {
+  const locations = (await vscode.commands.executeCommand<vscode.Location[]>(
+    "vscode.executeReferenceProvider",
+    uri,
+    position
+  )) ?? [];
+
+  return locations.filter((loc) => {
+    return !sameLocationAsDefinition(loc, uri, position);
+  });
 }
 
 function sameLocationAsDefinition(
@@ -147,6 +215,6 @@ function sameLocationAsDefinition(
 ): boolean {
   return (
     loc.uri.toString() === uri.toString() &&
-    loc.range.start.line === position.line
+    loc.range.contains(position)
   );
 }
